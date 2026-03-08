@@ -323,7 +323,7 @@ canvas#pieChart { flex-shrink:0; }
       </div>
       <div class="bottom-grid">
         <div class="card">
-          <div class="card-head"><h3>이달의 목표</h3><button class="btn btn-ghost btn-sm" onclick="openGoalModal()">수정</button></div>
+          <div class="card-head"><h3>이달의 목표</h3><button id="goalEditBtn" class="btn btn-ghost btn-sm" onclick="openGoalModal()">수정</button></div>
           <div class="g-label">목표 지출액</div><div class="g-val" id="goalTarget">₩0</div>
           <div class="g-label">현재 지출액</div><div class="g-val" id="goalCurrent">₩0</div>
           <div class="goal-bar"><div class="goal-bar-fill" id="goalBar" style="width:0%"></div></div>
@@ -553,8 +553,8 @@ let S={
   statsYear:new Date().getFullYear(),statsMonth:new Date().getMonth()+1,
   profilePersonIdx:0,selStar:5,editStar:5,editRateIdx:null,editEntryId:null,
   commentTargetId:null,statsPhoto:null,themeIdx:0,
-  users:[],           // users[0] = me, users[1..] = friends (live data)
-  friendUnsubs:[]     // onSnapshot unsubscribe functions
+  users:[],interactions:{},
+  friendUnsubs:[]
 };
 
 function me(){return S.users[0];}
@@ -575,6 +575,7 @@ async function save(){
     await setDoc(doc(db,'users',S.firebaseUid),{
       userData: S.users[0],
       friendUids: (S.users[0].friends||[]).map(f=>f.uid).filter(Boolean),
+      interactions: S.interactions||{},
       themeIdx: S.themeIdx,
       statsPhoto: S.statsPhoto||null,
       updatedAt: Date.now()
@@ -590,6 +591,7 @@ async function loadFromFirestore(uid){
       if(d.userData) S.users[0]=d.userData;
       if(d.themeIdx!=null) S.themeIdx=d.themeIdx;
       if(d.statsPhoto) S.statsPhoto=d.statsPhoto;
+      if(d.interactions) S.interactions=d.interactions;
       return true;
     }
   }catch(e){console.warn('Firestore load error:',e);}
@@ -771,16 +773,22 @@ function renderHome(){
   // table
   const tbody=document.getElementById('ledgerBody');
   tbody.innerHTML='';
-  if(!entries.length){tbody.innerHTML='<tr><td colspan="8" class="empty-msg" style="padding:28px">거래 내역이 없습니다</td></tr>';return;}
+  if(!entries.length){tbody.innerHTML='<tr><td colspan="8" class="empty-msg" style="padding:28px">거래 내역이 없습니다</td></tr>';}
+  else {
   const isMine=S.currentPersonIdx===0;
+  const friendUid=isMine?null:(getUser()._uid||null);
   [...entries].sort((a,b)=>a.date.localeCompare(b.date)).forEach(e=>{
+    // merge interactions if viewing friend
+    const displayEntry=(!isMine&&friendUid)?mergeEntryWithInteraction(e,friendUid):e;
+    const myUid=S.firebaseUid||me().id||'me';
     const tr=document.createElement('tr');
     const ds=e.date.slice(5).replace('-','/');
     const ev=['👍','🤙','👎'].map(em=>{
-      const cnt=Object.values(e.evals||{}).filter(v=>v===em).length;
-      return `<button class="eval-btn ${(e.evals||{})[me().id]===em?'selected':''}" onclick="setEval(${e.id},'${em}')"><span class="eval-emoji">${em}</span><span class="eval-count">${cnt||0}</span></button>`;
+      const cnt=Object.values(displayEntry.evals||{}).filter(v=>v===em).length;
+      const selected=(displayEntry.evals||{})[myUid]===em;
+      return `<button class="eval-btn ${selected?'selected':''}" onclick="setEval(${e.id},'${em}')"><span class="eval-emoji">${em}</span><span class="eval-count">${cnt||0}</span></button>`;
     }).join('');
-    const sc=(e.comments||[]).slice(-1)[0]||'';
+    const sc=(displayEntry.comments||[]).slice(-1)[0]||'';
     tr.innerHTML=`
       <td class="td-date">${ds}</td>
       <td><span class="cat-badge">${e.category}</span></td>
@@ -795,7 +803,9 @@ function renderHome(){
     `;
     tbody.appendChild(tr);
   });
-  // goal
+  }
+  // goal — hide edit button when viewing friend
+  const isMineGoal=S.currentPersonIdx===0;
   const goal=getUser().goals[getKey()]||0;
   document.getElementById('goalTarget').textContent='₩'+goal.toLocaleString();
   document.getElementById('goalCurrent').textContent='₩'+exp.toLocaleString();
@@ -806,8 +816,15 @@ function renderHome(){
   const pct=goal>0?Math.min((exp/goal)*100,100):0;
   const bar=document.getElementById('goalBar');
   bar.style.width=pct+'%';bar.className='goal-bar-fill'+(exp>goal&&goal>0?' over':'');
-  // ratings
-  const ratings=getUser().ratings[getKey()]||[];
+  // show/hide goal edit button
+  const goalEditBtn=document.getElementById('goalEditBtn');
+  if(goalEditBtn) goalEditBtn.style.display=isMineGoal?'':'none';
+  // ratings — merge friend's ratings + my ratings for this friend
+  const isMineRating=S.currentPersonIdx===0;
+  const friendUidR=isMineRating?null:(getUser()._uid||null);
+  const ratings=isMineRating
+    ?(getUser().ratings[getKey()]||[])
+    :getMergedRatings(friendUidR, getKey());
   const rl=document.getElementById('ratingList');
   if(!ratings.length){rl.innerHTML='<div class="empty-msg">아직 평가가 없습니다</div>';return;}
   rl.innerHTML=ratings.map((r,i)=>`
@@ -834,36 +851,66 @@ function nextMonth(){S.currentMonth++;if(S.currentMonth>12){S.currentMonth=1;S.c
 function prevStatsMonth(){S.statsMonth--;if(S.statsMonth<1){S.statsMonth=12;S.statsYear--;}renderStats();}
 function nextStatsMonth(){S.statsMonth++;if(S.statsMonth>12){S.statsMonth=1;S.statsYear++;}renderStats();}
 
-// ══════ SAVE FRIEND DATA ══════
-// When I interact with a friend's entry (eval, comment, rating),
-// the change must be written to the friend's Firestore document.
-async function saveFriendData(friendUid, updatedUserData){
-  try{
-    await setDoc(doc(db,'users',friendUid),{
-      userData: updatedUserData,
-      friendUids: (updatedUserData.friends||[]).map(f=>f.uid).filter(Boolean),
-      updatedAt: Date.now()
-    },{merge:true});
-  }catch(e){console.warn('saveFriendData error:',e);}
+// ══════ INTERACTIONS (evals, comments, ratings on friends' data) ══════
+// Stored in MY Firestore doc under interactions.{friendUid}
+// S.interactions = { [friendUid]: { entries: { [entryId]: {evals,comments} }, ratings: { [key]: [...] } } }
+
+function getInteraction(friendUid){
+  if(!S.interactions) S.interactions={};
+  if(!S.interactions[friendUid]) S.interactions[friendUid]={entries:{},ratings:{}};
+  return S.interactions[friendUid];
 }
 
-// Save current user's data — uses friend's Firestore if viewing friend
-async function saveCurrentUser(){
-  const idx=S.currentPersonIdx;
-  if(idx===0){
-    await save();
-  } else {
-    const u=S.users[idx];
-    if(u&&u._uid) await saveFriendData(u._uid, u);
-  }
+function getEntryInteraction(friendUid, entryId){
+  const ia=getInteraction(friendUid);
+  if(!ia.entries[entryId]) ia.entries[entryId]={evals:{},comments:[]};
+  return ia.entries[entryId];
+}
+
+async function saveInteractions(){
+  try{localStorage.setItem('mn_interactions',JSON.stringify(S.interactions||{}));}catch(e){}
+  if(!S.firebaseUid) return;
+  try{
+    await setDoc(doc(db,'users',S.firebaseUid),{interactions: S.interactions||{}},{merge:true});
+  }catch(e){console.warn('saveInteractions error:',e);}
+}
+
+// Merge friend's raw entry with my interaction overlay
+function mergeEntryWithInteraction(entry, friendUid){
+  const myUid=S.firebaseUid;
+  const ia=getEntryInteraction(friendUid, String(entry.id));
+  // merge evals: friend's original + my eval
+  const mergedEvals={...(entry.evals||{}), ...(ia.evals||{})};
+  // merge comments: friend's original + my comments
+  const mergedComments=[...(entry.comments||[]), ...(ia.comments||[])];
+  return {...entry, evals:mergedEvals, comments:mergedComments, _friendUid:friendUid};
+}
+
+// Get merged ratings for display (friend's ratings + my ratings for that friend)
+function getMergedRatings(friendUid, key){
+  const friendUser=S.users.find(u=>u._uid===friendUid);
+  const friendRatings=(friendUser&&friendUser.ratings&&friendUser.ratings[key])||[];
+  const ia=getInteraction(friendUid);
+  const myRatings=(ia.ratings&&ia.ratings[key])||[];
+  return [...friendRatings, ...myRatings];
 }
 
 function setEval(id,em){
-  const e=getUser().entries.find(x=>x.id===id);if(!e)return;
-  if(!e.evals)e.evals={};
-  const uid=me()._uid||me().id;
-  if(e.evals[uid]===em)delete e.evals[uid];else e.evals[uid]=em;
-  saveCurrentUser();renderHome();
+  const isMine=S.currentPersonIdx===0;
+  const myUid=S.firebaseUid||me().id||'me';
+  if(isMine){
+    const e=me().entries.find(x=>x.id===id);if(!e)return;
+    if(!e.evals)e.evals={};
+    if(e.evals[myUid]===em)delete e.evals[myUid];else e.evals[myUid]=em;
+    save();
+  } else {
+    const friendUid=getUser()._uid;if(!friendUid)return;
+    const ia=getEntryInteraction(friendUid,String(id));
+    if(!ia.evals)ia.evals={};
+    if(ia.evals[myUid]===em)delete ia.evals[myUid];else ia.evals[myUid]=em;
+    saveInteractions();
+  }
+  renderHome();
 }
 function deleteEntry(id){
   if(!confirm('이 거래를 삭제할까요?'))return;
@@ -928,30 +975,65 @@ function showContent(id){
 let _cid=null;
 function showComment(id){
   _cid=id;
-  const e=getUser().entries.find(x=>x.id===id);
+  const isMine=S.currentPersonIdx===0;
+  const friendUid=isMine?null:(getUser()._uid||null);
+  let allComments=[];
+  if(isMine){
+    const e=me().entries.find(x=>x.id===id);
+    allComments=e?(e.comments||[]):[];
+  } else {
+    const e=getUser().entries.find(x=>x.id===id);
+    const base=e?(e.comments||[]):[];
+    const ia=getEntryInteraction(friendUid,String(id));
+    allComments=[...base,...(ia.comments||[])];
+  }
   const cl=document.getElementById('commentList');
-  cl.innerHTML=(e.comments||[]).length
-    ?(e.comments||[]).map((c,i)=>`<div style="padding:8px 0;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center"><span style="font-size:13px">${c}</span><button onclick="deleteComment(${id},${i})" style="background:none;border:none;color:var(--text-soft);cursor:pointer;font-size:16px">×</button></div>`).join('')
+  cl.innerHTML=allComments.length
+    ?allComments.map((c,i)=>`<div style="padding:8px 0;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center"><span style="font-size:13px">${c}</span><button onclick="deleteComment(${id},${i})" style="background:none;border:none;color:var(--text-soft);cursor:pointer;font-size:16px">×</button></div>`).join('')
     :'<div class="empty-msg" style="padding:12px">아직 코멘트가 없습니다</div>';
   document.getElementById('newComment').value='';
   openModal('commentModal');
 }
 function deleteComment(eid,idx){
-  const e=getUser().entries.find(x=>x.id===eid);
-  if(e){e.comments.splice(idx,1);saveCurrentUser();showComment(eid);}
+  const isMine=S.currentPersonIdx===0;
+  if(isMine){
+    const e=me().entries.find(x=>x.id===eid);
+    if(e){e.comments.splice(idx,1);save();}
+  } else {
+    const friendUid=getUser()._uid;
+    const e=getUser().entries.find(x=>x.id===eid);
+    const baseLen=(e&&e.comments)?e.comments.length:0;
+    if(idx<baseLen){toast('친구의 원본 코멘트는 삭제할 수 없습니다');return;}
+    const ia=getEntryInteraction(friendUid,String(eid));
+    ia.comments.splice(idx-baseLen,1);
+    saveInteractions();
+  }
+  showComment(eid);
 }
 function submitComment(){
   const txt=document.getElementById('newComment').value.trim();if(!txt)return;
-  const e=getUser().entries.find(x=>x.id===_cid);
-  if(e){if(!e.comments)e.comments=[];e.comments.push(`${me().name}: ${txt}`);}
-  saveCurrentUser();closeModal('commentModal');renderHome();
+  const isMine=S.currentPersonIdx===0;
+  if(isMine){
+    const e=me().entries.find(x=>x.id===_cid);
+    if(e){if(!e.comments)e.comments=[];e.comments.push(`${me().name}: ${txt}`);}
+    save();
+  } else {
+    const friendUid=getUser()._uid;if(!friendUid)return;
+    const ia=getEntryInteraction(friendUid,String(_cid));
+    if(!ia.comments)ia.comments=[];
+    ia.comments.push(`${me().name}: ${txt}`);
+    saveInteractions();
+  }
+  closeModal('commentModal');renderHome();
 }
 
 // GOAL
 function openGoalModal(){document.getElementById('goalInput').value=getUser().goals[getKey()]||'';openModal('goalModal');}
 function submitGoal(){
-  getUser().goals[getKey()]=parseInt(document.getElementById('goalInput').value)||0;
-  saveCurrentUser();closeModal('goalModal');renderHome();
+  // only allow editing own goals
+  if(S.currentPersonIdx!==0){toast('본인의 목표만 수정할 수 있습니다');return;}
+  me().goals[getKey()]=parseInt(document.getElementById('goalInput').value)||0;
+  save();closeModal('goalModal');renderHome();
 }
 
 // RATE
@@ -960,26 +1042,72 @@ function setStar(n){S.selStar=n;updateStars('starInput',n);}
 function updateStars(id,n){document.querySelectorAll(`#${id} span`).forEach((s,i)=>s.className=i<n?'lit':'');}
 function submitRate(){
   const comment=document.getElementById('rateComment').value;
-  const u=getUser();const key=getKey();
-  if(!u.ratings[key])u.ratings[key]=[];
+  const key=getKey();
+  const isMine=S.currentPersonIdx===0;
   const now=new Date();
-  u.ratings[key].push({name:me().name,stars:S.selStar,comment,date:`${now.getFullYear()}.${now.getMonth()+1}.${now.getDate()}`,avatar:me().avatar});
-  saveCurrentUser();closeModal('rateModal');renderHome();
+  const rObj={name:me().name,stars:S.selStar,comment,date:`${now.getFullYear()}.${now.getMonth()+1}.${now.getDate()}`,avatar:me().avatar||null};
+  if(isMine){
+    const u=me();
+    if(!u.ratings[key])u.ratings[key]=[];
+    u.ratings[key].push(rObj);
+    save();
+  } else {
+    const friendUid=getUser()._uid;if(!friendUid)return;
+    const ia=getInteraction(friendUid);
+    if(!ia.ratings)ia.ratings={};
+    if(!ia.ratings[key])ia.ratings[key]=[];
+    ia.ratings[key].push(rObj);
+    saveInteractions();
+  }
+  closeModal('rateModal');renderHome();
 }
 function openEditRate(idx){
-  S.editRateIdx=idx;S.editStar=getUser().ratings[getKey()][idx].stars;
-  document.getElementById('editRateComment').value=getUser().ratings[getKey()][idx].comment||'';
+  S.editRateIdx=idx;
+  const isMine=S.currentPersonIdx===0;
+  const friendUid=isMine?null:(getUser()._uid||null);
+  const ratings=isMine?(getUser().ratings[getKey()]||[]):getMergedRatings(friendUid,getKey());
+  S.editStar=ratings[idx].stars;
+  document.getElementById('editRateComment').value=ratings[idx].comment||'';
   updateStars('editStarInput',S.editStar);openModal('editRateModal');
 }
 function setEditStar(n){S.editStar=n;updateStars('editStarInput',n);}
 function submitEditRate(){
-  const r=getUser().ratings[getKey()][S.editRateIdx];
-  r.stars=S.editStar;r.comment=document.getElementById('editRateComment').value;
-  saveCurrentUser();closeModal('editRateModal');renderHome();
+  const isMine=S.currentPersonIdx===0;
+  const key=getKey();
+  if(isMine){
+    const r=me().ratings[key][S.editRateIdx];
+    r.stars=S.editStar;r.comment=document.getElementById('editRateComment').value;
+    save();
+  } else {
+    const friendUid=getUser()._uid;
+    const friendRatings=(getUser().ratings&&getUser().ratings[key])||[];
+    const baseLen=friendRatings.length;
+    const ia=getInteraction(friendUid);
+    if(!ia.ratings)ia.ratings={};
+    if(!ia.ratings[key])ia.ratings[key]=[];
+    if(S.editRateIdx<baseLen){toast('친구의 원본 평가는 수정할 수 없습니다');return;}
+    const r=ia.ratings[key][S.editRateIdx-baseLen];
+    r.stars=S.editStar;r.comment=document.getElementById('editRateComment').value;
+    saveInteractions();
+  }
+  closeModal('editRateModal');renderHome();
 }
 function deleteRate(idx){
-  getUser().ratings[getKey()].splice(idx,1);
-  saveCurrentUser();renderHome();
+  const isMine=S.currentPersonIdx===0;
+  const key=getKey();
+  if(isMine){
+    me().ratings[key].splice(idx,1);
+    save();
+  } else {
+    const friendUid=getUser()._uid;
+    const friendRatings=(getUser().ratings&&getUser().ratings[key])||[];
+    const baseLen=friendRatings.length;
+    if(idx<baseLen){toast('친구의 원본 평가는 삭제할 수 없습니다');return;}
+    const ia=getInteraction(friendUid);
+    ia.ratings[key].splice(idx-baseLen,1);
+    saveInteractions();
+  }
+  renderHome();
 }
 
 // ══════ STATS ══════
