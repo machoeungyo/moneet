@@ -509,10 +509,8 @@ canvas#pieChart { flex-shrink:0; }
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
 import { getAuth, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged }
   from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js';
-import { getFirestore, doc, getDoc, setDoc, onSnapshot, collection }
+import { getFirestore, doc, getDoc, setDoc, onSnapshot }
   from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js';
-// expose collection+onSnapshot for use inside interaction functions
-window._firestoreExtras={collection, onSnapshot};
 
 // ══════ FIREBASE INIT ══════
 const firebaseConfig = {
@@ -555,7 +553,7 @@ let S={
   statsYear:new Date().getFullYear(),statsMonth:new Date().getMonth()+1,
   profilePersonIdx:0,selStar:5,editStar:5,editRateIdx:null,editEntryId:null,
   commentTargetId:null,statsPhoto:null,themeIdx:0,
-  users:[],interactions:{},friendInteractions:{},
+  users:[],interactions:{},receivedInteractions:{},
   friendUnsubs:[]
 };
 
@@ -667,17 +665,20 @@ function subscribeFriend(friendUid, friendObj){
 async function loadAllFriends(){
   unsubscribeAllFriends();
   S.users=S.users.slice(0,1);
-  S.friendInteractions={};
+  S.receivedInteractions={};
 
   const friends=me().friends||[];
   for(const f of friends){
     if(f.uid){
       subscribeFriend(f.uid,f);
-      subscribeInteractionsFor(f.uid); // watch all interactions on friend's doc
+      // load my existing interaction doc for this friend
+      await loadMyInteractions(f.uid);
+      // watch MY interaction doc on this friend (so UI stays in sync after save)
+      subscribeMyInteractionsOn(f.uid);
+      // watch friend's interaction doc on me (so I see what they wrote on my entries)
+      subscribeReceivedInteractions(f.uid);
     }
   }
-  // also watch interactions others left on MY doc
-  if(S.firebaseUid) subscribeInteractionsFor(S.firebaseUid);
 }
 
 // ══════ AUTH ══════
@@ -876,42 +877,61 @@ function nextMonth(){S.currentMonth++;if(S.currentMonth>12){S.currentMonth=1;S.c
 function prevStatsMonth(){S.statsMonth--;if(S.statsMonth<1){S.statsMonth=12;S.statsYear--;}renderStats();}
 function nextStatsMonth(){S.statsMonth++;if(S.statsMonth>12){S.statsMonth=1;S.statsYear++;}renderStats();}
 
-// ══════ INTERACTIONS — subcollection users/{friendUid}/interactions/{myUid} ══════
-// S.interactions[friendUid] = { entries:{[entryId]:{evals,comments}}, ratings:{[key]:[...]} }
-// S.friendInteractions[friendUid][authorUid] = same shape — interactions others wrote on that friend
+// ══════ INTERACTIONS — top-level collection ══════
+// Doc ID: {authorUid}_{targetUid}
+// Shape: { entries:{[entryId]:{evals,comments}}, ratings:{[key]:[...]} }
+//
+// S.interactions[targetUid]  = MY data I wrote on targetUid (local + server)
+// S.receivedInteractions[authorUid] = data others wrote on MY doc (from snapshot)
 
-function getInteraction(friendUid){
-  if(!S.interactions[friendUid]) S.interactions[friendUid]={entries:{},ratings:{}};
-  return S.interactions[friendUid];
+function interDocId(targetUid){ return `${S.firebaseUid}_${targetUid}`; }
+
+function getInteraction(targetUid){
+  if(!S.interactions[targetUid]) S.interactions[targetUid]={entries:{},ratings:{}};
+  return S.interactions[targetUid];
 }
-function getEntryInteraction(friendUid,entryId){
-  const ia=getInteraction(friendUid);
+function getEntryInteraction(targetUid, entryId){
+  const ia=getInteraction(targetUid);
   const k=String(entryId);
   if(!ia.entries[k]) ia.entries[k]={evals:{},comments:[]};
   return ia.entries[k];
 }
 
-// Save MY interactions on a specific friend to subcollection
-async function saveInteractions(friendUid){
+async function saveInteractions(targetUid){
   const myUid=S.firebaseUid; if(!myUid)return;
-  const data=S.interactions[friendUid]||{entries:{},ratings:{}};
+  const data=S.interactions[targetUid]||{entries:{},ratings:{}};
   try{
-    await setDoc(doc(db,'users',friendUid,'interactions',myUid), data);
+    await setDoc(doc(db,'interactions',`${myUid}_${targetUid}`), data);
   }catch(e){console.warn('saveInteractions error:',e);}
 }
 
-// Subscribe to ALL interactions written on a friend's doc (by anyone)
-// and also subscribe to interactions others wrote on MY doc
-function subscribeInteractionsFor(targetUid){
-  const {collection, onSnapshot:_onSnap}=window._firestoreExtras;
-  const unsub=_onSnap(collection(db,'users',targetUid,'interactions'),(snap)=>{
-    if(!S.friendInteractions) S.friendInteractions={};
-    if(!S.friendInteractions[targetUid]) S.friendInteractions[targetUid]={};
-    snap.forEach(d=>{
-      S.friendInteractions[targetUid][d.id]=d.data();
-    });
+// Load MY interaction doc for a given target (once on login)
+async function loadMyInteractions(targetUid){
+  try{
+    const snap=await getDoc(doc(db,'interactions',`${S.firebaseUid}_${targetUid}`));
+    if(snap.exists()) S.interactions[targetUid]=snap.data();
+  }catch(e){}
+}
+
+// Subscribe to interactions others wrote ON MY doc  →  {authorUid}_{myUid}
+// We query by listening to each friend's interaction doc on me
+function subscribeReceivedInteractions(authorUid){
+  const docRef=doc(db,'interactions',`${authorUid}_${S.firebaseUid}`);
+  const unsub=onSnapshot(docRef,(snap)=>{
+    if(!S.receivedInteractions) S.receivedInteractions={};
+    S.receivedInteractions[authorUid]=snap.exists()?snap.data():{entries:{},ratings:{}};
     rerender();
-  },(e)=>console.warn('interactions snapshot error:',e));
+  },(e)=>console.warn('received interactions error:',e));
+  S.friendUnsubs.push(unsub);
+}
+
+// Subscribe to MY interaction docs on each friend  →  {myUid}_{friendUid}
+function subscribeMyInteractionsOn(targetUid){
+  const docRef=doc(db,'interactions',`${S.firebaseUid}_${targetUid}`);
+  const unsub=onSnapshot(docRef,(snap)=>{
+    if(snap.exists()) S.interactions[targetUid]=snap.data();
+    rerender();
+  },(e)=>console.warn('my interactions error:',e));
   S.friendUnsubs.push(unsub);
 }
 
@@ -920,62 +940,50 @@ function rerender(){
   if(!p) return;
   const id=p.id.replace('panel-','');
   if(id==='home') renderHome();
-  else if(id==='stats') renderStats();
   else if(id==='profile') renderProfile();
 }
 
-// Get all interactions on a friend entry (from all authors including me)
+// ── Merge helpers ──
+
+// All interactions on a friend's entry (my writes + friend's own evals on their entries)
 function getAllEntryInteractions(friendUid, entryId){
   const k=String(entryId);
-  const allAuthors={};
-  // my own pending (not yet synced from server)
-  const myIa=S.interactions[friendUid];
-  if(myIa&&myIa.entries&&myIa.entries[k]) allAuthors[S.firebaseUid]=myIa.entries[k];
-  // from subscribed snapshot
-  const fi=(S.friendInteractions||{})[friendUid]||{};
-  Object.entries(fi).forEach(([authorUid,data])=>{
-    if(data.entries&&data.entries[k]) allAuthors[authorUid]=data.entries[k];
-  });
-  // merge evals and comments from all authors
   let mergedEvals={};
   let mergedComments=[];
-  Object.values(allAuthors).forEach(a=>{
-    Object.assign(mergedEvals, a.evals||{});
-    mergedComments=[...mergedComments,...(a.comments||[])];
-  });
+
+  // friend's original entry evals/comments
+  const friendUser=S.users.find(u=>u._uid===friendUid);
+  const orig=friendUser&&friendUser.entries&&friendUser.entries.find(x=>String(x.id)===k);
+  if(orig){
+    Object.assign(mergedEvals, orig.evals||{});
+    mergedComments=[...mergedComments,...(orig.comments||[])];
+  }
+  // MY interactions I wrote on this friend
+  const myIa=S.interactions[friendUid];
+  if(myIa&&myIa.entries&&myIa.entries[k]){
+    Object.assign(mergedEvals, myIa.entries[k].evals||{});
+    mergedComments=[...mergedComments,...(myIa.entries[k].comments||[])];
+  }
   return {evals:mergedEvals, comments:mergedComments};
 }
 
-// Get all ratings on a friend (from all authors including me)
+// All ratings on a friend (friend's own + MY interactions on them)
 function getAllRatings(friendUid, key){
   const friendUser=S.users.find(u=>u._uid===friendUid);
   const base=(friendUser&&friendUser.ratings&&friendUser.ratings[key])||[];
-  const allExtra=[];
-  // my own
   const myIa=S.interactions[friendUid];
-  if(myIa&&myIa.ratings&&myIa.ratings[key]) allExtra.push(...myIa.ratings[key]);
-  // from others via snapshot
-  const fi=(S.friendInteractions||{})[friendUid]||{};
-  Object.entries(fi).forEach(([authorUid,data])=>{
-    if(authorUid===S.firebaseUid) return; // already added above
-    if(data.ratings&&data.ratings[key]) allExtra.push(...data.ratings[key]);
-  });
-  return [...base,...allExtra];
+  const mine=(myIa&&myIa.ratings&&myIa.ratings[key])||[];
+  return [...base,...mine];
 }
 
-// Get interactions others left on MY entries
+// My entry interactions: my own evals + what friends wrote on my entries
 function getMyEntryInteractions(entryId){
   const k=String(entryId);
-  const fi=(S.friendInteractions||{})[S.firebaseUid]||{};
-  let mergedEvals={};
-  let mergedComments=[];
-  // my own evals/comments on my own entries
   const myEntry=me().entries.find(x=>String(x.id)===k);
-  if(myEntry){
-    Object.assign(mergedEvals, myEntry.evals||{});
-    mergedComments=[...mergedComments,...(myEntry.comments||[])];
-  }
-  Object.values(fi).forEach(data=>{
+  let mergedEvals={...(myEntry&&myEntry.evals||{})};
+  let mergedComments=[...(myEntry&&myEntry.comments||[])];
+  // received from friends
+  Object.values(S.receivedInteractions||{}).forEach(data=>{
     if(data.entries&&data.entries[k]){
       Object.assign(mergedEvals, data.entries[k].evals||{});
       mergedComments=[...mergedComments,...(data.entries[k].comments||[])];
@@ -984,12 +992,11 @@ function getMyEntryInteractions(entryId){
   return {evals:mergedEvals, comments:mergedComments};
 }
 
-// Get all ratings on MY entries from friends
+// My ratings: own + received from friends
 function getMyRatings(key){
   const base=(me().ratings&&me().ratings[key])||[];
-  const fi=(S.friendInteractions||{})[S.firebaseUid]||{};
   const extra=[];
-  Object.values(fi).forEach(data=>{
+  Object.values(S.receivedInteractions||{}).forEach(data=>{
     if(data.ratings&&data.ratings[key]) extra.push(...data.ratings[key]);
   });
   return [...base,...extra];
@@ -1211,7 +1218,8 @@ function deleteRate(idx){
 // ══════ STATS ══════
 function renderStats(){
   document.getElementById('statsMonthLabel').textContent=`${S.statsYear}년 ${S.statsMonth}월`;
-  const u=getUser();
+  // stats always shows MY data only
+  const u=me();
   const entries=u.entries.filter(e=>{
     const d=new Date(e.date);
     return d.getFullYear()===S.statsYear&&(d.getMonth()+1)===S.statsMonth;
