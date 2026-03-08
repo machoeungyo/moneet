@@ -510,7 +510,7 @@ canvas#pieChart { flex-shrink:0; }
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
 import { getAuth, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged }
   from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js';
-import { getFirestore, doc, getDoc, setDoc, updateDoc }
+import { getFirestore, doc, getDoc, setDoc, onSnapshot }
   from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js';
 
 // ══════ FIREBASE INIT ══════
@@ -523,9 +523,9 @@ const firebaseConfig = {
   appId: "1:167370642611:web:e30e0f119e4e47310c0cc6",
   measurementId: "G-5J85LHLQTM"
 };
-const fbApp  = initializeApp(firebaseConfig);
-const auth   = getAuth(fbApp);
-const db     = getFirestore(fbApp);
+const fbApp = initializeApp(firebaseConfig);
+const auth  = getAuth(fbApp);
+const db    = getFirestore(fbApp);
 
 // ══════ THEMES ══════
 const THEMES = [
@@ -553,7 +553,9 @@ let S={
   currentPersonIdx:0,currentYear:new Date().getFullYear(),currentMonth:new Date().getMonth()+1,
   statsYear:new Date().getFullYear(),statsMonth:new Date().getMonth()+1,
   profilePersonIdx:0,selStar:5,editStar:5,editRateIdx:null,editEntryId:null,
-  commentTargetId:null,statsPhoto:null,themeIdx:0,users:[]
+  commentTargetId:null,statsPhoto:null,themeIdx:0,
+  users:[],           // users[0] = me, users[1..] = friends (live data)
+  friendUnsubs:[]     // onSnapshot unsubscribe functions
 };
 
 function me(){return S.users[0];}
@@ -566,83 +568,137 @@ function filteredEntries(u){
 }
 function genCode(){return Math.random().toString(36).substring(2,8).toUpperCase();}
 
-// ══════ FIRESTORE SAVE / LOAD ══════
+// ══════ FIRESTORE — MY DATA ══════
 async function save(){
-  // always mirror to localStorage as fallback
-  try{localStorage.setItem('mn_data',JSON.stringify({users:S.users,themeIdx:S.themeIdx,statsPhoto:S.statsPhoto}));}catch(e){}
-  if(!S.firebaseUid) return;
-  try {
-    await setDoc(doc(db,'users',S.firebaseUid), {
-      users: S.users,
+  try{localStorage.setItem('mn_data',JSON.stringify({users:[S.users[0]],themeIdx:S.themeIdx,statsPhoto:S.statsPhoto}));}catch(e){}
+  if(!S.firebaseUid)return;
+  try{
+    await setDoc(doc(db,'users',S.firebaseUid),{
+      userData: S.users[0],
+      friendUids: (S.users[0].friends||[]).map(f=>f.uid).filter(Boolean),
       themeIdx: S.themeIdx,
-      statsPhoto: S.statsPhoto || null,
+      statsPhoto: S.statsPhoto||null,
       updatedAt: Date.now()
     });
-  } catch(e){ console.warn('Firestore save error:',e); }
+  }catch(e){console.warn('Firestore save error:',e);}
 }
 
 async function loadFromFirestore(uid){
-  try {
-    const snap = await getDoc(doc(db,'users',uid));
+  try{
+    const snap=await getDoc(doc(db,'users',uid));
     if(snap.exists()){
-      const d = snap.data();
-      if(d.users && d.users.length) S.users = d.users;
-      if(d.themeIdx != null) S.themeIdx = d.themeIdx;
-      if(d.statsPhoto) S.statsPhoto = d.statsPhoto;
+      const d=snap.data();
+      if(d.userData) S.users[0]=d.userData;
+      if(d.themeIdx!=null) S.themeIdx=d.themeIdx;
+      if(d.statsPhoto) S.statsPhoto=d.statsPhoto;
       return true;
     }
-  } catch(e){ console.warn('Firestore load error:',e); }
+  }catch(e){console.warn('Firestore load error:',e);}
   return false;
 }
 
-// ══════ AUTH ══════
-// Expose to HTML onclick handlers via window
-window.googleLogin = async function(){
-  try {
-    const provider = new GoogleAuthProvider();
-    await signInWithPopup(auth, provider);
-    // onAuthStateChanged will handle the rest
-  } catch(e){
-    if(e.code !== 'auth/popup-closed-by-user'){
-      toast('로그인 실패: ' + e.message);
+// ══════ FRIEND CODE INDEX ══════
+async function registerFriendCode(uid, code){
+  try{
+    await setDoc(doc(db,'friendCodes',code),{uid, updatedAt:Date.now()});
+  }catch(e){console.warn('friendCode register error:',e);}
+}
+
+async function lookupFriendCode(code){
+  try{
+    const snap=await getDoc(doc(db,'friendCodes',code));
+    if(snap.exists()) return snap.data().uid;
+  }catch(e){console.warn('friendCode lookup error:',e);}
+  return null;
+}
+
+// ══════ REAL-TIME FRIEND LISTENERS ══════
+function unsubscribeAllFriends(){
+  S.friendUnsubs.forEach(u=>u());
+  S.friendUnsubs=[];
+}
+
+function subscribeFriend(friendUid, friendObj){
+  // Remove any existing listener for this uid
+  const existingIdx=S.users.findIndex(u=>u._uid===friendUid);
+
+  const unsub=onSnapshot(doc(db,'users',friendUid),(snap)=>{
+    if(!snap.exists()) return;
+    const d=snap.data();
+    const friendData={
+      ...(d.userData||{}),
+      _uid: friendUid,
+      // preserve the display name the user gave, fallback to Firestore name
+      name: friendObj.name||(d.userData&&d.userData.name)||'친구',
+    };
+    // update or insert in S.users
+    const idx=S.users.findIndex(u=>u._uid===friendUid);
+    if(idx>0){
+      S.users[idx]=friendData;
+    } else {
+      S.users.push(friendData);
+    }
+    // re-render whichever panel is active
+    const activePanel=document.querySelector('.panel.active');
+    if(activePanel){
+      const id=activePanel.id.replace('panel-','');
+      if(id==='home') renderHome();
+      else if(id==='stats') renderStats();
+      else if(id==='profile') renderProfile();
+    }
+  },(err)=>{console.warn('friend snapshot error:',err);});
+
+  S.friendUnsubs.push(unsub);
+}
+
+async function loadAllFriends(){
+  unsubscribeAllFriends();
+  // Remove old friend entries from S.users (keep only index 0 = me)
+  S.users=S.users.slice(0,1);
+
+  const friends=me().friends||[];
+  for(const f of friends){
+    if(f.uid){
+      subscribeFriend(f.uid, f);
     }
   }
-};
+}
 
-window.demoLogin = function(){
-  doLogin({name:'나',email:'demo@moneet.app',photoURL:null}, null);
-};
-
-window.logout = async function(){
-  if(!confirm('로그아웃 하시겠습니까?')) return;
-  if(S.firebaseUid){
-    try{ await signOut(auth); }catch(e){}
+// ══════ AUTH ══════
+window.googleLogin=async function(){
+  try{
+    const provider=new GoogleAuthProvider();
+    await signInWithPopup(auth,provider);
+  }catch(e){
+    if(e.code!=='auth/popup-closed-by-user') toast('로그인 실패: '+e.message);
   }
-  S.firebaseUid = null;
-  S.users = [];
+};
+
+window.logout=async function(){
+  if(!confirm('로그아웃 하시겠습니까?'))return;
+  unsubscribeAllFriends();
+  if(S.firebaseUid){try{await signOut(auth);}catch(e){}}
+  S.firebaseUid=null; S.users=[];
   document.getElementById('app').style.display='none';
   document.getElementById('loginScreen').classList.remove('hidden');
 };
 
-// Firebase auth state listener
-onAuthStateChanged(auth, async (fbUser) => {
+onAuthStateChanged(auth,async(fbUser)=>{
   if(fbUser){
-    S.firebaseUid = fbUser.uid;
-    const loaded = await loadFromFirestore(fbUser.uid);
-    const gu = {
-      name: fbUser.displayName || fbUser.email.split('@')[0],
+    S.firebaseUid=fbUser.uid;
+    const loaded=await loadFromFirestore(fbUser.uid);
+    const gu={
+      name: fbUser.displayName||fbUser.email.split('@')[0],
       email: fbUser.email,
-      photoURL: fbUser.photoURL || null
+      photoURL: fbUser.photoURL||null
     };
-    doLogin(gu, fbUser.uid, loaded);
+    await doLogin(gu,fbUser.uid,loaded);
   }
 });
 
-async function doLogin(gu, uid, alreadyLoaded){
-  S.currentUser = gu;
-  S.firebaseUid = uid;
+async function doLogin(gu,uid,alreadyLoaded){
+  S.currentUser=gu; S.firebaseUid=uid;
 
-  // If not from Firestore, try localStorage
   if(!alreadyLoaded){
     try{
       const r=localStorage.getItem('mn_data');
@@ -650,22 +706,27 @@ async function doLogin(gu, uid, alreadyLoaded){
     }catch(e){}
   }
 
-  if(S.users.length===0){
-    S.users.push({
-      id: uid || 'demo',
-      name: gu.name,
-      email: gu.email,
-      avatar: gu.photoURL || null,
-      friendCode: genCode(),
+  if(!S.users[0]||!S.users[0].friendCode){
+    const code=genCode();
+    S.users[0]={
+      id:uid,_uid:uid,
+      name:gu.name, email:gu.email, avatar:gu.photoURL||null,
+      friendCode:code,
       categories:['식비','교통','쇼핑','문화/여가','의료','통신','주거','저축','기타'],
       entries:[], goals:{}, ratings:{}, friends:[]
-    });
+    };
     await save();
+    await registerFriendCode(uid, code);
   } else {
-    // sync only name/email — never overwrite user's saved avatar
-    S.users[0].name  = gu.name;
-    S.users[0].email = gu.email;
+    S.users[0]._uid=uid;
+    S.users[0].name=gu.name;
+    S.users[0].email=gu.email;
+    // ensure friendCode is registered
+    if(S.users[0].friendCode) registerFriendCode(uid, S.users[0].friendCode);
   }
+
+  // subscribe to all friends' real-time data
+  await loadAllFriends();
 
   document.getElementById('loginScreen').classList.add('hidden');
   document.getElementById('app').style.display='flex';
@@ -1031,33 +1092,56 @@ function deleteCategory(i){
 }
 
 function openAddFriendModal(){document.getElementById('friendCodeInput').value='';document.getElementById('friendNameInput').value='';openModal('addFriendModal');}
-function addFriend(){
+async function addFriend(){
   const code=document.getElementById('friendCodeInput').value.trim().toUpperCase();
   const nameIn=document.getElementById('friendNameInput').value.trim();
   if(!code||code.length<4){toast('코드를 입력해주세요');return;}
   if(code===me().friendCode){toast('자신의 코드는 추가할 수 없어요');return;}
   if((me().friends||[]).find(f=>f.code===code)){toast('이미 추가된 친구입니다');return;}
-  // check local users
-  const matched=S.users.find(u=>u.friendCode===code);
-  const fname=nameIn||(matched?matched.name:'친구');
-  const fobj={name:fname,code,avatar:matched?matched.avatar:null,id:matched?matched.id:code};
+
+  toast('친구를 찾는 중...');
+  const friendUid=await lookupFriendCode(code);
+  if(!friendUid){toast('해당 코드의 친구를 찾을 수 없어요');return;}
+
+  // load friend's name from Firestore
+  let fname=nameIn;
+  if(!fname){
+    try{
+      const snap=await getDoc(doc(db,'users',friendUid));
+      if(snap.exists()&&snap.data().userData) fname=snap.data().userData.name||'친구';
+      else fname='친구';
+    }catch(e){fname='친구';}
+  }
+
+  const fobj={name:fname,code,uid:friendUid};
   if(!me().friends)me().friends=[];
   me().friends.push(fobj);
-  // add placeholder user if not present
-  if(!matched){
-    S.users.push({id:code,name:fname,email:'',avatar:null,friendCode:code,categories:['식비','교통','쇼핑','문화/여가','기타'],entries:[],goals:{},ratings:{},friends:[]});
-  }
-  save();closeModal('addFriendModal');toast(`${fname}님을 친구로 추가했어요! 🎉`);renderProfile();renderHome();
+  await save();
+
+  // start real-time subscription
+  subscribeFriend(friendUid,fobj);
+
+  closeModal('addFriendModal');
+  toast(`${fname}님을 친구로 추가했어요! 🎉`);
+  renderProfile();renderHome();
 }
+
 function removeFriend(i){
   if(!confirm('친구를 삭제할까요?'))return;
   const f=me().friends[i];
   me().friends.splice(i,1);
-  // remove placeholder
-  const idx=S.users.findIndex(u=>u.id===f.id&&S.users.indexOf(u)>0);
-  if(idx>0)S.users.splice(idx,1);
+
+  // remove from S.users and unsubscribe
+  const idx=S.users.findIndex(u=>u._uid===f.uid);
+  if(idx>0){
+    S.users.splice(idx,1);
+    // unsubscribe: rebuild all listeners cleanly
+    unsubscribeAllFriends();
+    (me().friends||[]).forEach(fr=>{if(fr.uid)subscribeFriend(fr.uid,fr);});
+  }
   if(S.currentPersonIdx>=S.users.length)S.currentPersonIdx=0;
   if(S.profilePersonIdx>=S.users.length)S.profilePersonIdx=0;
+
   save();renderProfile();renderHome();
 }
 
