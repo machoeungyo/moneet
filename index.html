@@ -494,7 +494,6 @@ canvas#pieChart { flex-shrink:0; }
 <div class="modal-bg hidden" id="addFriendModal">
   <div class="modal"><h2>친구 추가</h2>
     <div class="form-group"><label>친구 코드 입력 (6자리)</label><input type="text" id="friendCodeInput" placeholder="예: AB12CD" maxlength="6" style="text-transform:uppercase;letter-spacing:3px;font-family:'DM Sans',sans-serif;font-size:18px;text-align:center"></div>
-    <div class="form-group"><label>표시 이름 (선택)</label><input type="text" id="friendNameInput" placeholder="친구 이름"></div>
     <div class="modal-actions"><button class="btn btn-ghost" onclick="closeModal('addFriendModal')">취소</button><button class="btn btn-primary" onclick="addFriend()">추가</button></div>
   </div>
 </div>
@@ -619,26 +618,21 @@ function unsubscribeAllFriends(){
 }
 
 function subscribeFriend(friendUid, friendObj){
-  // Remove any existing listener for this uid
-  const existingIdx=S.users.findIndex(u=>u._uid===friendUid);
-
   const unsub=onSnapshot(doc(db,'users',friendUid),(snap)=>{
-    if(!snap.exists()) return;
+    if(!snap.exists())return;
     const d=snap.data();
     const friendData={
       ...(d.userData||{}),
       _uid: friendUid,
-      // preserve the display name the user gave, fallback to Firestore name
-      name: friendObj.name||(d.userData&&d.userData.name)||'친구',
+      // always use the name from friend's own Firestore data
+      name: (d.userData&&d.userData.name)||friendObj.name||'친구',
     };
-    // update or insert in S.users
     const idx=S.users.findIndex(u=>u._uid===friendUid);
     if(idx>0){
       S.users[idx]=friendData;
     } else {
       S.users.push(friendData);
     }
-    // re-render whichever panel is active
     const activePanel=document.querySelector('.panel.active');
     if(activePanel){
       const id=activePanel.id.replace('panel-','');
@@ -647,7 +641,6 @@ function subscribeFriend(friendUid, friendObj){
       else if(id==='profile') renderProfile();
     }
   },(err)=>{console.warn('friend snapshot error:',err);});
-
   S.friendUnsubs.push(unsub);
 }
 
@@ -841,12 +834,36 @@ function nextMonth(){S.currentMonth++;if(S.currentMonth>12){S.currentMonth=1;S.c
 function prevStatsMonth(){S.statsMonth--;if(S.statsMonth<1){S.statsMonth=12;S.statsYear--;}renderStats();}
 function nextStatsMonth(){S.statsMonth++;if(S.statsMonth>12){S.statsMonth=1;S.statsYear++;}renderStats();}
 
+// ══════ SAVE FRIEND DATA ══════
+// When I interact with a friend's entry (eval, comment, rating),
+// the change must be written to the friend's Firestore document.
+async function saveFriendData(friendUid, updatedUserData){
+  try{
+    await setDoc(doc(db,'users',friendUid),{
+      userData: updatedUserData,
+      friendUids: (updatedUserData.friends||[]).map(f=>f.uid).filter(Boolean),
+      updatedAt: Date.now()
+    },{merge:true});
+  }catch(e){console.warn('saveFriendData error:',e);}
+}
+
+// Save current user's data — uses friend's Firestore if viewing friend
+async function saveCurrentUser(){
+  const idx=S.currentPersonIdx;
+  if(idx===0){
+    await save();
+  } else {
+    const u=S.users[idx];
+    if(u&&u._uid) await saveFriendData(u._uid, u);
+  }
+}
+
 function setEval(id,em){
   const e=getUser().entries.find(x=>x.id===id);if(!e)return;
   if(!e.evals)e.evals={};
-  const uid=me().id;
+  const uid=me()._uid||me().id;
   if(e.evals[uid]===em)delete e.evals[uid];else e.evals[uid]=em;
-  save();renderHome();
+  saveCurrentUser();renderHome();
 }
 function deleteEntry(id){
   if(!confirm('이 거래를 삭제할까요?'))return;
@@ -921,20 +938,20 @@ function showComment(id){
 }
 function deleteComment(eid,idx){
   const e=getUser().entries.find(x=>x.id===eid);
-  if(e){e.comments.splice(idx,1);save();showComment(eid);}
+  if(e){e.comments.splice(idx,1);saveCurrentUser();showComment(eid);}
 }
 function submitComment(){
   const txt=document.getElementById('newComment').value.trim();if(!txt)return;
   const e=getUser().entries.find(x=>x.id===_cid);
   if(e){if(!e.comments)e.comments=[];e.comments.push(`${me().name}: ${txt}`);}
-  save();closeModal('commentModal');renderHome();
+  saveCurrentUser();closeModal('commentModal');renderHome();
 }
 
 // GOAL
 function openGoalModal(){document.getElementById('goalInput').value=getUser().goals[getKey()]||'';openModal('goalModal');}
 function submitGoal(){
   getUser().goals[getKey()]=parseInt(document.getElementById('goalInput').value)||0;
-  save();closeModal('goalModal');renderHome();
+  saveCurrentUser();closeModal('goalModal');renderHome();
 }
 
 // RATE
@@ -947,7 +964,7 @@ function submitRate(){
   if(!u.ratings[key])u.ratings[key]=[];
   const now=new Date();
   u.ratings[key].push({name:me().name,stars:S.selStar,comment,date:`${now.getFullYear()}.${now.getMonth()+1}.${now.getDate()}`,avatar:me().avatar});
-  save();closeModal('rateModal');renderHome();
+  saveCurrentUser();closeModal('rateModal');renderHome();
 }
 function openEditRate(idx){
   S.editRateIdx=idx;S.editStar=getUser().ratings[getKey()][idx].stars;
@@ -958,11 +975,11 @@ function setEditStar(n){S.editStar=n;updateStars('editStarInput',n);}
 function submitEditRate(){
   const r=getUser().ratings[getKey()][S.editRateIdx];
   r.stars=S.editStar;r.comment=document.getElementById('editRateComment').value;
-  save();closeModal('editRateModal');renderHome();
+  saveCurrentUser();closeModal('editRateModal');renderHome();
 }
 function deleteRate(idx){
   getUser().ratings[getKey()].splice(idx,1);
-  save();renderHome();
+  saveCurrentUser();renderHome();
 }
 
 // ══════ STATS ══════
@@ -1091,10 +1108,9 @@ function deleteCategory(i){
   getPU().categories.splice(i,1);save();renderProfile();
 }
 
-function openAddFriendModal(){document.getElementById('friendCodeInput').value='';document.getElementById('friendNameInput').value='';openModal('addFriendModal');}
+function openAddFriendModal(){document.getElementById('friendCodeInput').value='';openModal('addFriendModal');}
 async function addFriend(){
   const code=document.getElementById('friendCodeInput').value.trim().toUpperCase();
-  const nameIn=document.getElementById('friendNameInput').value.trim();
   if(!code||code.length<4){toast('코드를 입력해주세요');return;}
   if(code===me().friendCode){toast('자신의 코드는 추가할 수 없어요');return;}
   if((me().friends||[]).find(f=>f.code===code)){toast('이미 추가된 친구입니다');return;}
@@ -1103,22 +1119,18 @@ async function addFriend(){
   const friendUid=await lookupFriendCode(code);
   if(!friendUid){toast('해당 코드의 친구를 찾을 수 없어요');return;}
 
-  // load friend's name from Firestore
-  let fname=nameIn;
-  if(!fname){
-    try{
-      const snap=await getDoc(doc(db,'users',friendUid));
-      if(snap.exists()&&snap.data().userData) fname=snap.data().userData.name||'친구';
-      else fname='친구';
-    }catch(e){fname='친구';}
-  }
+  // load friend's name from their Firestore data
+  let fname='친구';
+  try{
+    const snap=await getDoc(doc(db,'users',friendUid));
+    if(snap.exists()&&snap.data().userData) fname=snap.data().userData.name||'친구';
+  }catch(e){}
 
   const fobj={name:fname,code,uid:friendUid};
   if(!me().friends)me().friends=[];
   me().friends.push(fobj);
   await save();
 
-  // start real-time subscription
   subscribeFriend(friendUid,fobj);
 
   closeModal('addFriendModal');
