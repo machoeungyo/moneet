@@ -569,15 +569,16 @@ function genCode(){return Math.random().toString(36).substring(2,8).toUpperCase(
 
 // ══════ FIRESTORE — MY DATA ══════
 async function save(){
+  // save to localStorage (with avatar)
   try{localStorage.setItem('mn_data',JSON.stringify({users:[S.users[0]],themeIdx:S.themeIdx,statsPhoto:S.statsPhoto}));}catch(e){}
   if(!S.firebaseUid)return;
-  // Store avatar separately (can be large base64) — keep userData lean
-  const userDataToSave={...S.users[0]};
-  const avatarToSave=userDataToSave.avatar||null;
-  // keep avatar in userData too so friends' snapshot gets it
+  // Strip avatar out of userData before saving to Firestore (avoid 1MB limit)
+  // Avatar is stored separately in the top-level `avatar` field
+  const avatarToSave=S.users[0].avatar||null;
+  const userDataSlim={...S.users[0], avatar:null};
   try{
     await setDoc(doc(db,'users',S.firebaseUid),{
-      userData: userDataToSave,
+      userData: userDataSlim,
       avatar: avatarToSave,
       friendUids: (S.users[0].friends||[]).map(f=>f.uid).filter(Boolean),
       themeIdx: S.themeIdx,
@@ -585,13 +586,12 @@ async function save(){
       updatedAt: Date.now()
     });
   }catch(e){
-    console.warn('Firestore save error (possibly avatar too large):',e);
-    // retry without avatar in userData if too large
+    console.warn('Firestore save error:',e);
+    // last resort: try without avatar
     try{
-      const slim={...userDataToSave, avatar:null};
       await setDoc(doc(db,'users',S.firebaseUid),{
-        userData: slim,
-        avatar: avatarToSave,
+        userData: userDataSlim,
+        avatar: null,
         friendUids: (S.users[0].friends||[]).map(f=>f.uid).filter(Boolean),
         themeIdx: S.themeIdx,
         statsPhoto: S.statsPhoto||null,
@@ -606,9 +606,9 @@ async function loadFromFirestore(uid){
     const snap=await getDoc(doc(db,'users',uid));
     if(snap.exists()){
       const d=snap.data();
-      if(d.userData) S.users[0]=d.userData;
-      // restore avatar from top-level field if not in userData
-      if(d.avatar&&!S.users[0].avatar) S.users[0].avatar=d.avatar;
+      if(d.userData) S.users[0]={...d.userData};
+      // avatar is stored at top level, restore it into users[0]
+      S.users[0].avatar=d.avatar||null;
       if(d.themeIdx!=null) S.themeIdx=d.themeIdx;
       if(d.statsPhoto) S.statsPhoto=d.statsPhoto;
       return true;
@@ -1301,29 +1301,22 @@ function removeStatsPhoto(ev){
 
 // ══════ PROFILE ══════
 function renderProfile(){
-  const tabs=document.getElementById('profileTabs');
-  tabs.innerHTML='';
-  S.users.forEach((u,i)=>{
-    const btn=document.createElement('button');
-    btn.className='person-selector-tab'+(i===S.profilePersonIdx?' active':'');
-    btn.textContent=u.name;btn.onclick=()=>{S.profilePersonIdx=i;renderProfile();};
-    tabs.appendChild(btn);
-  });
-  const pu=getPU();
+  // Profile tab always shows MY data only — no person tabs
+  document.getElementById('profileTabs').innerHTML='';
+  const u=me();
   const ai=document.getElementById('profileAvatarImg'),at=document.getElementById('profileAvatarText');
-  if(pu.avatar){ai.src=pu.avatar;ai.style.display='block';at.style.display='none';}
-  else{ai.style.display='none';at.style.display='block';at.textContent=pu.name.charAt(0);}
-  document.getElementById('profileNameDisplay').textContent=pu.name;
-  document.getElementById('profileEmail').textContent=pu.email||'—';
-  document.getElementById('myFriendCodeDisplay').textContent=pu.friendCode||'—';
-  // friends
+  if(u.avatar){ai.src=u.avatar;ai.style.display='block';at.style.display='none';}
+  else{ai.style.display='none';at.style.display='block';at.textContent=u.name.charAt(0);}
+  document.getElementById('profileNameDisplay').textContent=u.name;
+  document.getElementById('profileEmail').textContent=u.email||'—';
+  document.getElementById('myFriendCodeDisplay').textContent=u.friendCode||'—';
+  // friends list (unchanged)
   const fl=document.getElementById('friendList');
-  const friends=pu.friends||[];
+  const friends=u.friends||[];
   fl.innerHTML=friends.length
     ?friends.map((f,i)=>{
-      // get live avatar from S.users (from Firestore snapshot), fallback to f.avatar
-      const liveUser=S.users.find(u=>u._uid===f.uid);
-      const av=liveUser?liveUser.avatar:f.avatar;
+      const liveUser=S.users.find(x=>x._uid===f.uid);
+      const av=liveUser?liveUser.avatar:null;
       const nm=liveUser?liveUser.name:f.name;
       return `<div class="friend-item">
         <div class="friend-avatar">${av?`<img src="${av}">`:`${nm.charAt(0)}`}</div>
@@ -1332,12 +1325,11 @@ function renderProfile(){
         <button class="friend-remove" onclick="removeFriend(${i})">×</button>
       </div>`;}).join('')
     :'<div class="empty-msg">아직 친구가 없습니다</div>';
-  // cats — always show MY categories, hide edit section if viewing friend
-  const isMyProfile=S.profilePersonIdx===0;
+  // cats — always my categories
   const catCard=document.getElementById('catCard');
-  if(catCard) catCard.style.display=isMyProfile?'':'none';
+  if(catCard) catCard.style.display='';
   const grid=document.getElementById('catGrid');grid.innerHTML='';
-  me().categories.forEach((c,i)=>{
+  u.categories.forEach((c,i)=>{
     const chip=document.createElement('div');chip.className='cat-chip';
     chip.innerHTML=`${c}<button class="cat-del" onclick="deleteCategory(${i})">×</button>`;
     grid.appendChild(chip);
@@ -1347,15 +1339,14 @@ function renderProfile(){
 
 function handleAvatarUpload(e){
   const f=e.target.files[0];if(!f)return;
-  const r=new FileReader();r.onload=ev=>{getPU().avatar=ev.target.result;save();renderProfile();renderHome();};r.readAsDataURL(f);
+  const r=new FileReader();r.onload=ev=>{me().avatar=ev.target.result;save();renderProfile();renderHome();};r.readAsDataURL(f);
 }
-function removeAvatar(){getPU().avatar=null;save();renderProfile();renderHome();}
+function removeAvatar(){me().avatar=null;save();renderProfile();renderHome();}
 
-function openNameModal(){document.getElementById('nameInput').value=getPU().name;openModal('nameModal');}
+function openNameModal(){document.getElementById('nameInput').value=me().name;openModal('nameModal');}
 function saveName(){
   const v=document.getElementById('nameInput').value.trim();if(!v)return;
-  getPU().name=v;
-  if(S.profilePersonIdx===0){const gu=loadGU();if(gu){gu.name=v;saveGU(gu);}}
+  me().name=v;
   save();closeModal('nameModal');renderProfile();renderHome();
 }
 
@@ -1418,7 +1409,7 @@ function removeFriend(i){
 }
 
 function copyCode(){
-  const code=getPU().friendCode;
+  const code=me().friendCode;
   if(navigator.clipboard){navigator.clipboard.writeText(code).then(()=>toast('코드가 복사됐어요! 📋')).catch(()=>prompt('코드를 복사하세요:',code));}
   else prompt('코드를 복사하세요:',code);
 }
