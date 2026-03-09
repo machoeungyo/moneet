@@ -417,7 +417,7 @@ canvas#pieChart { flex-shrink:0; }
         <div class="card-head"><h3>친구</h3><button class="btn btn-primary btn-sm" onclick="openAddFriendModal()">+ 추가</button></div>
         <div id="friendList"></div>
       </div>
-      <div class="card" style="margin-top:14px">
+      <div class="card" id="catCard" style="margin-top:14px">
         <div class="card-head"><h3>카테고리 관리</h3></div>
         <div class="cats-grid" id="catGrid"></div>
         <div class="add-cat-row">
@@ -851,17 +851,17 @@ function renderHome(){
   const rl=document.getElementById('ratingList');
   if(!ratings.length){rl.innerHTML='<div class="empty-msg">아직 평가가 없습니다</div>';return;}
   rl.innerHTML=ratings.map((r,i)=>{
-    // look up live avatar from S.users by authorUid, fallback to stored avatar
     const authorUser=r.authorUid?S.users.find(u=>u._uid===r.authorUid):null;
     const av=authorUser?authorUser.avatar:(r.avatar||null);
+    const isMyRating=r.authorUid===S.firebaseUid;
     return `<div class="rating-item">
       <div class="r-avatar">${av?`<img src="${av}">`:`${(r.name||'?').charAt(0)}`}</div>
       <div style="flex:1">
         <div style="display:flex;justify-content:space-between">
           <div><div style="font-size:12px;font-weight:600">${r.name}</div><div style="font-size:10px;color:var(--text-soft)">${r.date}</div></div>
           <div style="display:flex;gap:3px">
-            <button class="icon-btn" onclick="openEditRate(${i})"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>
-            <button class="icon-btn del" onclick="deleteRate(${i})"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+            ${isMyRating?`<button class="icon-btn" onclick="openEditRate(${i})"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>
+            <button class="icon-btn del" onclick="deleteRate(${i})"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>`:''}
           </div>
         </div>
         <div class="r-stars">${'★'.repeat(r.stars)}${'☆'.repeat(5-r.stars)}</div>
@@ -994,7 +994,9 @@ function getMyEntryInteractions(entryId){
 
 // My ratings: own + received from friends
 function getMyRatings(key){
-  const base=(me().ratings&&me().ratings[key])||[];
+  const myUid=S.firebaseUid;
+  // stamp authorUid on own ratings that lack it
+  const base=((me().ratings&&me().ratings[key])||[]).map(r=>r.authorUid?r:{...r,authorUid:myUid});
   const extra=[];
   Object.values(S.receivedInteractions||{}).forEach(data=>{
     if(data.ratings&&data.ratings[key]) extra.push(...data.ratings[key]);
@@ -1085,15 +1087,26 @@ function showComment(id){
   const isMine=S.currentPersonIdx===0;
   const merged=isMine ? getMyEntryInteractions(id) : getAllEntryInteractions(getUser()._uid, id);
   const comments=merged.comments||[];
+  const myName=me().name;
   const cl=document.getElementById('commentList');
   cl.innerHTML=comments.length
-    ?comments.map((c,i)=>`<div style="padding:8px 0;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center"><span style="font-size:13px">${c}</span><button onclick="deleteComment(${id},${i})" style="background:none;border:none;color:var(--text-soft);cursor:pointer;font-size:16px">×</button></div>`).join('')
+    ?comments.map((c,i)=>{
+      // only show delete button if this comment was written by me
+      const isMineComment=c.startsWith(myName+': ');
+      return `<div style="padding:8px 0;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
+        <span style="font-size:13px">${c}</span>
+        ${isMineComment?`<button onclick="deleteComment(${id},${i})" style="background:none;border:none;color:var(--text-soft);cursor:pointer;font-size:16px;flex-shrink:0">×</button>`:''}
+      </div>`;}).join('')
     :'<div class="empty-msg" style="padding:12px">아직 코멘트가 없습니다</div>';
   document.getElementById('newComment').value='';
   openModal('commentModal');
 }
 function deleteComment(eid,idx){
   const isMine=S.currentPersonIdx===0;
+  // extra safety: re-check ownership
+  const merged=isMine ? getMyEntryInteractions(eid) : getAllEntryInteractions(getUser()._uid, eid);
+  const c=(merged.comments||[])[idx]||'';
+  if(!c.startsWith(me().name+': ')){toast('본인이 작성한 코멘트만 삭제할 수 있습니다');showComment(eid);return;}
   if(isMine){
     const e=me().entries.find(x=>x.id===eid);
     if(e&&e.comments){e.comments.splice(idx,1);save();}
@@ -1159,12 +1172,15 @@ function submitRate(){
   closeModal('rateModal');renderHome();
 }
 function openEditRate(idx){
-  S.editRateIdx=idx;
   const isMine=S.currentPersonIdx===0;
   const friendUid=isMine?null:(getUser()._uid||null);
   const ratings=isMine ? getMyRatings(getKey()) : getAllRatings(friendUid, getKey());
-  S.editStar=ratings[idx].stars;
-  document.getElementById('editRateComment').value=ratings[idx].comment||'';
+  const r=ratings[idx];
+  if(!r){return;}
+  if(r.authorUid&&r.authorUid!==S.firebaseUid){toast('본인이 작성한 평가만 수정할 수 있습니다');return;}
+  S.editRateIdx=idx;
+  S.editStar=r.stars;
+  document.getElementById('editRateComment').value=r.comment||'';
   updateStars('editStarInput',S.editStar);openModal('editRateModal');
 }
 function setEditStar(n){S.editStar=n;updateStars('editStarInput',n);}
@@ -1197,13 +1213,16 @@ function submitEditRate(){
 function deleteRate(idx){
   const isMine=S.currentPersonIdx===0;
   const key=getKey();
+  const friendUid=isMine?null:(getUser()._uid||null);
+  const ratings=isMine ? getMyRatings(key) : getAllRatings(friendUid, key);
+  const r=ratings[idx];
+  if(r&&r.authorUid&&r.authorUid!==S.firebaseUid){toast('본인이 작성한 평가만 삭제할 수 있습니다');return;}
   if(isMine){
     const baseLen=((me().ratings&&me().ratings[key])||[]).length;
     if(idx>=baseLen){toast('다른 사람의 평가는 삭제할 수 없습니다');return;}
     me().ratings[key].splice(idx,1);
     save();
   } else {
-    const friendUid=getUser()._uid;
     const friendRatings=(getUser().ratings&&getUser().ratings[key])||[];
     const baseLen=friendRatings.length;
     if(idx<baseLen){toast('친구의 원본 평가는 삭제할 수 없습니다');return;}
@@ -1313,9 +1332,12 @@ function renderProfile(){
         <button class="friend-remove" onclick="removeFriend(${i})">×</button>
       </div>`;}).join('')
     :'<div class="empty-msg">아직 친구가 없습니다</div>';
-  // cats
+  // cats — always show MY categories, hide edit section if viewing friend
+  const isMyProfile=S.profilePersonIdx===0;
+  const catCard=document.getElementById('catCard');
+  if(catCard) catCard.style.display=isMyProfile?'':'none';
   const grid=document.getElementById('catGrid');grid.innerHTML='';
-  pu.categories.forEach((c,i)=>{
+  me().categories.forEach((c,i)=>{
     const chip=document.createElement('div');chip.className='cat-chip';
     chip.innerHTML=`${c}<button class="cat-del" onclick="deleteCategory(${i})">×</button>`;
     grid.appendChild(chip);
@@ -1339,11 +1361,11 @@ function saveName(){
 
 function addCategory(){
   const inp=document.getElementById('newCatInput');const v=inp.value.trim();if(!v)return;
-  getPU().categories.push(v);inp.value='';save();renderProfile();
+  me().categories.push(v);inp.value='';save();renderProfile();
 }
 function deleteCategory(i){
   if(!confirm('카테고리를 삭제할까요?'))return;
-  getPU().categories.splice(i,1);save();renderProfile();
+  me().categories.splice(i,1);save();renderProfile();
 }
 
 function openAddFriendModal(){document.getElementById('friendCodeInput').value='';openModal('addFriendModal');}
