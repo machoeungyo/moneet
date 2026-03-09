@@ -1290,11 +1290,7 @@ function renderStatsPhoto(){
   if(S.statsPhoto){img.src=S.statsPhoto;img.style.display='block';ph.style.display='none';}
   else{img.style.display='none';ph.style.display='flex';}
 }
-function handleStatsPhoto(ev){
-  const f=ev.target.files[0];if(!f)return;
-  const r=new FileReader();r.onload=e=>{S.statsPhoto=e.target.result;save();renderStatsPhoto();};r.readAsDataURL(f);
-  ev.target.value='';
-}
+
 function removeStatsPhoto(ev){
   ev.stopPropagation();S.statsPhoto=null;save();renderStatsPhoto();
 }
@@ -1337,9 +1333,51 @@ function renderProfile(){
   renderColorPicker();
 }
 
+// Compress image to fit within maxSize bytes via canvas resize+quality reduction
+function compressImage(file, maxW, maxH, maxBytes){
+  return new Promise((resolve)=>{
+    const reader=new FileReader();
+    reader.onload=e=>{
+      const img=new Image();
+      img.onload=()=>{
+        let w=img.width, h=img.height;
+        // scale down to fit maxW x maxH
+        if(w>maxW||h>maxH){
+          const ratio=Math.min(maxW/w, maxH/h);
+          w=Math.round(w*ratio); h=Math.round(h*ratio);
+        }
+        const canvas=document.createElement('canvas');
+        canvas.width=w; canvas.height=h;
+        canvas.getContext('2d').drawImage(img,0,0,w,h);
+        // try quality from 0.85 down until under maxBytes
+        let q=0.85, result;
+        do{
+          result=canvas.toDataURL('image/jpeg',q);
+          q=Math.round((q-0.1)*100)/100;
+        }while(result.length>maxBytes&&q>0.1);
+        resolve(result);
+      };
+      img.src=e.target.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
 function handleAvatarUpload(e){
   const f=e.target.files[0];if(!f)return;
-  const r=new FileReader();r.onload=ev=>{me().avatar=ev.target.result;save();renderProfile();renderHome();};r.readAsDataURL(f);
+  // avatar: 256×256, max 200KB
+  compressImage(f,256,256,200*1024).then(data=>{
+    me().avatar=data;save();renderProfile();renderHome();
+  });
+}
+
+function handleStatsPhoto(ev){
+  const f=ev.target.files[0];if(!f)return;
+  // stats photo: 800×600, max 400KB
+  compressImage(f,800,600,400*1024).then(data=>{
+    S.statsPhoto=data;save();renderStatsPhoto();
+  });
+  ev.target.value='';
 }
 function removeAvatar(){me().avatar=null;save();renderProfile();renderHome();}
 
